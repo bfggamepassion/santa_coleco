@@ -8,6 +8,8 @@
 	
 	.globl  _snd_table
 	.globl  _music
+	.globl  _xmas_melody
+	.globl  _xmas_bass
     
 	.area _CODE
 
@@ -374,6 +376,9 @@ _snd_table:
 	.dw    #ch2_C1,0x702b+20              ; = 12
 	.dw    #ch2_C2,0x702b+20              ; = 13
 	.dw    #ch2_C3,0x702b+20              ; = 14
+
+	.dw    #_xmas_melody,0x702b+20        ; = 15 musique : melodie (canal 2)
+	.dw    #_xmas_bass,0x702b+30          ; = 16 musique : basse (canal 3)
 
 	; ********************
 	;  MUSIC SEQUENCE

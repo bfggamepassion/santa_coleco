@@ -39,6 +39,30 @@ extern const byte SPATTERNRLE[];
 extern const byte PATTERNRLE[];
 extern const byte COLORRLE[];
 
+/* from title.c */
+extern const byte TITLE_PATRLE[];
+extern const byte TITLE_COLRLE[];
+
+/* from scroll.c : decors pre-decales au pixel */
+extern const byte* const scrollObj_Frames[];
+extern const byte SKY_FIRST;
+extern const byte SKY_PATRLE[];
+extern const byte SKY_COLRLE[];
+extern const byte GND_FIRST;
+extern const byte GND_PATRLE[];
+extern const byte GND_COLRLE[];
+
+#define SND_MELODY 0x15	/* Jingle Bells, voir xmas.s */
+#define SND_BASS 0x16
+void playMusic();
+void stopMusic();
+
+#define SCROLLOBJ_ARBRE 0
+#define SCROLLOBJ_BONHOMME 1
+
+/* from vdpfast.s */
+void vdp_put_rect(unsigned vram_addr, void *src, byte n, byte w, byte h);
+
 // Variables pour gestion du flickering
 byte currentFlicker;
 sprite_t bsprites[32];
@@ -104,6 +128,12 @@ typedef struct
 
 s_scrollObj scrollObj[MAXSCROLLOBJ];
 
+// Decalage en pixels (7..0) a l'interieur du caractere, commun a tous les decors
+byte scrollPhase;
+
+// Affichage du score par la NMI (pas pendant l'écran titre)
+byte showHud;
+
 
 char getFreeScrollObj()
 {
@@ -125,7 +155,7 @@ byte createScrollObj(byte pattern,char cy,byte ha, byte la)
 	scrollObj[res].p = pattern;
 	scrollObj[res].h = ha;
 	scrollObj[res].l = la;
-	scrollObj[res].x = 20+la; // On crée en dehors de l'écran à droite
+	scrollObj[res].x = 32; // On crée en dehors de l'écran à droite
 	scrollObj[res].y = cy;
 	
 	return S_TRUE;
@@ -133,32 +163,44 @@ byte createScrollObj(byte pattern,char cy,byte ha, byte la)
 
 void moveAndShowScrollObj()
 {
-	int i;
-
-	s_scrollObj *this_scrollObj;
-	char *this_scrollObj_x;
-	char *this_scrollObj_y;
-	byte *this_scrollObj_h;
-	byte *this_scrollObj_l;
-	byte *this_scrollObj_p;
+	byte i,w,c0,c1;
+	char x;
+	s_scrollObj *o;
 	
-	for (i=0;i<MAXSCROLLOBJ;i++)
+	o = scrollObj;
+	for (i=0;i<MAXSCROLLOBJ;i++,o++)
 	{
-		this_scrollObj = &scrollObj[i];
-		this_scrollObj_p = &this_scrollObj->p;
-		this_scrollObj_x = &this_scrollObj->x;
-		this_scrollObj_y = &this_scrollObj->y;
-		this_scrollObj_l = &this_scrollObj->l;
-		this_scrollObj_h = &this_scrollObj->h;
+		if (o->x<=-10) continue;
 		
+		if (scrollPhase==7) o->x--;
+		// Le sol avance par pas de 2 pixels : son image ne change qu'aux phases impaires
+		if ((o->p<=SCROLLOBJ_BONHOMME) && !(scrollPhase&1)) continue;
 		
+		// Colonnes visibles c0..c1-1 de l'objet
+		x = o->x;
+		w = o->l;
+		c0 = (x<0) ? -x : 0;
+		c1 = (x+w>32) ? 32-x : w;
+		if (c1<=c0) continue;
 		
-		if ((*this_scrollObj_x)>-10) 
-		{
-			put_frame(scrollObj_Pointer[(*this_scrollObj_p)],(*this_scrollObj_x),(*this_scrollObj_y),(*this_scrollObj_l),(*this_scrollObj_h));
-			(*this_scrollObj_x) --;
-		}
+		vdp_put_rect(chrtab+(o->y<<5)+x+c0,(void *)(scrollObj_Frames[(o->p<<3)+scrollPhase]+c0),c1-c0,w,o->h);
 	}
+}
+
+// Avance les decors d'un pixel vers la gauche
+void scrollScenery()
+{
+	if (scrollPhase==0) scrollPhase = 7; else scrollPhase--;
+	moveAndShowScrollObj();
+}
+
+// Charge les caracteres pre-decales : ciel dans le 1er tiers, sol dans le 3eme
+void loadScrollChars()
+{
+	rle2vram((void *)SKY_PATRLE,chrgen+(SKY_FIRST<<3));
+	rle2vram((void *)SKY_COLRLE,coltab+(SKY_FIRST<<3));
+	rle2vram((void *)GND_PATRLE,chrgen+4096+(GND_FIRST<<3));
+	rle2vram((void *)GND_COLRLE,coltab+4096+(GND_FIRST<<3));
 }
 
 void activateSprite(byte s,byte x,byte y,byte p,byte c)
@@ -246,20 +288,13 @@ void generateEnnemy()
 	
 	if (timer128==0)
 	{
+		// Sapins et bonshommes au sol (3eme tiers), etoiles et boules dans le ciel (1er tiers)
 		scrollObjNumber = rnd_byte(0,3);
-		scrollObjPosition = rnd_byte(0,1);
-		if (scrollObjPosition==0)
-		{		
-			scrollObjPosition = 1;
-		}
+		if (scrollObjNumber==SCROLLOBJ_ARBRE) scrollObjPosition = 16;
 		else
-		{
-			if (scrollObjNumber==0) scrollObjPosition = 16;
-			else
-			if (scrollObjNumber==1) scrollObjPosition = 18;
-			else
-				scrollObjPosition = 20;
-		}
+		if (scrollObjNumber==SCROLLOBJ_BONHOMME) scrollObjPosition = 18;
+		else
+			scrollObjPosition = rnd_byte(1,5);
 		createScrollObj(scrollObjNumber,scrollObjPosition,scrollObj_Init[(scrollObjNumber<<2)+1],scrollObj_Init[(scrollObjNumber<<2)+2]);
 	}
 	
@@ -385,94 +420,67 @@ void generateEnnemy()
 	}
 }
 
-// Version non optimisée.
+// Version optimisée (pointeurs) : même comportement que l'originale
+void killEnnemy(s_ennemySprite *e, sprite_t *s)
+{
+	s->y = INACTIF;
+	e->type = INACTIF;
+	ligne[e->ligne] = 0;
+}
+
 void moveEnnemySprite()
 {
-	byte i;
+	byte i,t;
+	s_ennemySprite *e;
+	sprite_t *s;
 	
-	for (i=0;i<MAXENNEMYSPRITE;i++)
+	e = ennemySprite;
+	for (i=0;i<MAXENNEMYSPRITE;i++,e++)
 	{
-		if (ennemySprite[i].type == EN_GIFT1)
+		t = e->type;
+		if (t==INACTIF) continue;
+		s = &sprites[e->sprno];
+		
+		if ((t==EN_GIFT1) || (t==EN_GIFT2))
 		{
-			if (ennemySprite[i].sens==GAUCHE)
+			if (e->sens==GAUCHE)
 			{
-				if (timer2==0)
-				sprites[ennemySprite[i].sprno].x--;
+				if ((t==EN_GIFT2) || (timer2==0)) s->x--;
 			}
 			else
-			sprites[ennemySprite[i].sprno].x+=3;
+			s->x+=3;
 			
-			if (sprites[ennemySprite[i].sprno].x<5) 
+			if (s->x<5) 
 			{
-				sprites[ennemySprite[i].sprno].y = INACTIF;
-				ennemySprite[i].type = INACTIF;
-				ligne[ennemySprite[i].ligne]=0;
+				killEnnemy(e,s);
 				player.miss++;
 			}
 			
-			if (sprites[ennemySprite[i].sprno].x>200)  ennemySprite[i].sens = GAUCHE;
-			
-			//if (timer8>4) sprites[ennemySprite[i].sprno].pattern = 8; else sprites[ennemySprite[i].sprno].pattern = 4;
+			if (s->x>200) e->sens = GAUCHE;
 		}
 		else
-		if (ennemySprite[i].type == EN_GIFT2)
+		if (t==EN_GIFT3)
 		{
-			if (ennemySprite[i].sens==GAUCHE)
-			{
-				//if (timer2==0)
-				sprites[ennemySprite[i].sprno].x--;
-			}
-			else
-			sprites[ennemySprite[i].sprno].x+=3;
+			s->x-=2;
 			
-			if (sprites[ennemySprite[i].sprno].x<5) 
+			if (s->x<5) 
 			{
-				sprites[ennemySprite[i].sprno].y = INACTIF;
-				ennemySprite[i].type = INACTIF;
-				ligne[ennemySprite[i].ligne]=0;
+				killEnnemy(e,s);
 				player.miss++;
 			}
-			
-			if (sprites[ennemySprite[i].sprno].x>200)  ennemySprite[i].sens = GAUCHE;
-			
-			//if (timer8>4) sprites[ennemySprite[i].sprno].pattern = 8; else sprites[ennemySprite[i].sprno].pattern = 4;
 		}
 		else
-		if (ennemySprite[i].type == EN_GIFT3)
+		if (t==EN_BOMB)
 		{
-			sprites[ennemySprite[i].sprno].x-=2;
-			
-			if (sprites[ennemySprite[i].sprno].x<5) 
-			{
-				sprites[ennemySprite[i].sprno].y = INACTIF;
-				ligne[ennemySprite[i].ligne]=0;
-				ennemySprite[i].type = INACTIF;
-				player.miss++;
-			}
-			
-			
-			//if (timer8>4) sprites[ennemySprite[i].sprno].pattern = 8; else sprites[ennemySprite[i].sprno].pattern = 4;
-		}
-		else
-		if (ennemySprite[i].type == EN_BOMB)
-		{
-			if (timer2==0) sprites[ennemySprite[i].sprno].x--;
+			if (timer2==0) s->x--;
 			if (timer8==0) 
 			{
-				if (sprites[ennemySprite[i].sprno].pattern == 32) sprites[ennemySprite[i].sprno].pattern = 36;
-				else sprites[ennemySprite[i].sprno].pattern = 32;
+				if (s->pattern == 32) s->pattern = 36;
+				else s->pattern = 32;
 			}
 
-			if (sprites[ennemySprite[i].sprno].x<5) 
-			{
-				sprites[ennemySprite[i].sprno].y = INACTIF;
-				ligne[ennemySprite[i].ligne]=0;
-				ennemySprite[i].type = INACTIF;				
-			}
-			
-				
+			if (s->x<5) killEnnemy(e,s);
 		}
-
 	}
 }
 
@@ -544,6 +552,7 @@ byte checkCollision()
 			
 				sprites[player.sprno1].pattern = 40;
 				sprites[player.sprno2].pattern = 40;
+				stopMusic();
 				stop_sound(4);stop_sound(5);
 				play_sound(4);play_sound(5);
 				delay(120);
@@ -641,6 +650,50 @@ void renderNumber(byte x,byte y,byte n)
 	put_char(x,y,pointage[4]);
 }
 
+void loadCharset()
+{
+	load_patternrle(PATTERNRLE);
+	duplicate_pattern();
+	rle2vram(COLORRLE,coltab);
+	rle2vram(COLORRLE,coltab+2048);
+	rle2vram(COLORRLE,coltab+4096);
+}
+
+void playMusic()
+{
+	stop_sound(SND_MELODY);
+	stop_sound(SND_BASS);
+	play_sound(SND_MELODY);
+	play_sound(SND_BASS);
+}
+
+void stopMusic()
+{
+	stop_sound(SND_MELODY);
+	stop_sound(SND_BASS);
+}
+
+void titleScreen()
+{
+	screen_off();
+	disable_nmi();
+	rle2vram((void *)TITLE_PATRLE,chrgen);
+	rle2vram((void *)TITLE_COLRLE,coltab);
+	set_default_name_table(chrtab);
+	screen_on();
+	enable_nmi();
+	playMusic();
+	
+	pause();
+	
+	screen_off();
+	disable_nmi();
+	loadCharset();
+	cls();
+	screen_on();
+	enable_nmi();
+}
+
 void presentation()
 {
 	screen_off();
@@ -666,9 +719,11 @@ void doGameOver()
 {
 	byte i;
 	
+	stopMusic();
 	screen_off();
 	disable_nmi();
 	for (i=0;i<32;i++) sprites[i].y = 204;
+	loadCharset();
 	changeFontColor(6,15);
 	cls();
 	center_string(2,"GAME OVER");
@@ -683,8 +738,7 @@ void doGameOver()
 	center_string(15,"PARTICULAR GREETINGS TO :");
 	center_string(17,"YOUKI");
 	center_string(18,"NEWCOLECO");
-	center_string(19,"RETROILLUCID");
-	center_string(22,"MERRY CHRISTMAS 2011 !!!");
+	center_string(22,"MERRY CHRISTMAS 2011 AND 2026 !");
 	
 	screen_on();
 	enable_nmi();
@@ -722,6 +776,8 @@ void main(void)
 	player.cpt = 0;
 	player.miss=0;
 	gameOver = 0;
+	scrollPhase = 0;
+	showHud = 0;
 
 	for (i=0;i<MAXSCROLLOBJ;i++)
 	{
@@ -742,21 +798,17 @@ void main(void)
 	screen_mode_2_bitmap();
 	screen_off();
 	rle2vram(SPATTERNRLE,sprtab);
-	load_patternrle(PATTERNRLE);
-	duplicate_pattern();
-	
-	/* Chargement des couleurs */
-	rle2vram(COLORRLE,coltab);
-	rle2vram(COLORRLE,coltab+2048);
-	rle2vram(COLORRLE,coltab+4096);	
 	screen_on();
 	enable_nmi();
 	
+	titleScreen();
+	showHud = 1;
 	presentation();
 	
 	disable_nmi();
 	screen_off();
 	changeFontColor(6,15);
+	loadScrollChars();
 	cls();
 	screen_on();
 	enable_nmi();
@@ -782,8 +834,8 @@ void main(void)
 		
 		if (currentFlicker<2) currentFlicker++; else currentFlicker=1;
 		move = timer2;
-		if ((joypad_1 & UP) && (sprites[shoot.sprno].y==INVISIBLE) && (sprites[player.sprno2].y>8)) { sprites[player.sprno1].y -=2;sprites[player.sprno2].y -=2;}
-		if ((joypad_1 & DOWN)  && (sprites[shoot.sprno].y==INVISIBLE) && (sprites[player.sprno2].y<(192-16))) { sprites[player.sprno1].y +=2;sprites[player.sprno2].y +=2;	}
+		if ((joypad_1 & UP) && (sprites[player.sprno2].y>8)) { sprites[player.sprno1].y -=2;sprites[player.sprno2].y -=2;}
+		if ((joypad_1 & DOWN) && (sprites[player.sprno2].y<(192-16))) { sprites[player.sprno1].y +=2;sprites[player.sprno2].y +=2;	}
 		if ( (joypad_1 & FIRE1) || (joypad_1 & FIRE2) )
 		{
 			if (sprites[shoot.sprno].y==INVISIBLE)
@@ -807,11 +859,13 @@ void main(void)
 		}
 		
 		moveEnnemySprite();
-		disable_nmi();
-		if (timer8==0) moveAndShowScrollObj();
-		enable_nmi();
 			
 		delay(1);
+		
+		// Juste apres le VBLANK : les decors avancent d'un pixel par image
+		disable_nmi();
+		scrollScenery();
+		enable_nmi();
 
 		if (timer8<7) timer8++; else timer8=0;			
 		if (timer16<15) timer16++; else timer16=0;			
@@ -836,7 +890,7 @@ void nmi()
 	}
 	
 
-	if (timer8==0) {
+	if ((timer8==0) && showHud) {
 		print_at(5,0,str(player.score));	
 		print_at(10,0,"00");
 		renderMiss();		
